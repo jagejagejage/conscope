@@ -128,6 +128,27 @@ def event_price_history(database: Database, event_id: str) -> dict[str, list[dic
     }
 
 
+def monitoring_status_snapshot(database: Database) -> dict[str, list[dict[str, Any]]]:
+    """Return persisted check times and simulation-only monitor alert records."""
+    checks = []
+    for event in database.list_events():
+        for provider in event.get("providers", []):
+            checks.append({
+                "event": event["name"],
+                "provider": provider["display_name"],
+                "provider_key": provider["provider_key"],
+                "paused": bool(event["is_paused"]),
+                "last_attempt_at": provider.get("last_attempt_at"),
+                "last_success_at": provider.get("last_success_at"),
+                "next_check_at": provider.get("next_check_at"),
+                "last_error": provider.get("last_error"),
+            })
+    return {
+        "checks": checks,
+        "simulation_alerts": database.list_monitor_alert_records(simulation_only=True),
+    }
+
+
 def run_manual_mock_check(database: Database, event_id: str) -> StoredResult:
     event = database.get_event(event_id)
     if event is None:

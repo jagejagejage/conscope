@@ -82,7 +82,20 @@ export TICKETMASTER_API_KEY='your-key'
 python -m streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
-On PowerShell, set it with `$env:TICKETMASTER_API_KEY = 'your-key'`. Open `http://127.0.0.1:8501` and use **Find an event to watch**. Search only discovers events and saves a target; live ticket checks, automated monitoring, and email alerts remain disabled. The advanced manual event form is still available. On macOS, local data is stored in `~/Library/Application Support/ConScope/conscope.sqlite3`. Set `CONSCOPE_DATA_DIR` to use another data directory.
+On PowerShell, set it with `$env:TICKETMASTER_API_KEY = 'your-key'`. Open `http://127.0.0.1:8501` and use **Find an event to watch**. Search only discovers events and saves a target; live provider ticket checks and email alerts remain disabled. The advanced manual event form is still available. On macOS, local data is stored in `~/Library/Application Support/ConScope/conscope.sqlite3`. Set `CONSCOPE_DATA_DIR` to use another data directory.
+
+### Local Monitoring Engine
+
+The automatic monitor currently supports simulated mock prices only. Run one pass or explicitly create simulation-only alert records with:
+
+```bash
+python3 scripts/run_monitor.py once
+python3 scripts/run_monitor.py once --simulation
+python3 scripts/run_monitor.py schedule --simulation --interval-seconds 300
+python3 -m unittest tests.test_monitoring tests.test_providers tests.test_local_database tests.test_dashboard_data -v
+```
+
+The scheduler is optional. See [docs/MONITORING.md](docs/MONITORING.md) for threshold qualification, alert rearming, and provider limitations. Ticketmaster live pricing and SeatGeek remain disabled. The Resend delivery foundation is not connected to monitoring or customer alert subscriptions; see [docs/EMAIL_NOTIFICATIONS.md](docs/EMAIL_NOTIFICATIONS.md) for safe local preview and explicit test-email setup.
 
 ### Running the Legacy Kafka System
 

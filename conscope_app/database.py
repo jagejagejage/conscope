@@ -8,6 +8,7 @@ not implicitly remove user data.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import math
 import json
 import os
@@ -18,7 +19,7 @@ from typing import Any, Iterable, Iterator, Mapping
 import uuid
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 6
 
 
 def default_data_directory() -> Path:
@@ -229,6 +230,75 @@ class Database:
             """
         )
 
+    @staticmethod
+    def _migration_5(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            BEGIN EXCLUSIVE;
+            CREATE TABLE monitor_alert_state (
+                tracked_event_id TEXT PRIMARY KEY REFERENCES tracked_events(id) ON DELETE CASCADE,
+                armed INTEGER NOT NULL DEFAULT 1 CHECK (armed IN (0, 1)),
+                cycle_number INTEGER NOT NULL DEFAULT 1 CHECK (cycle_number >= 1),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            INSERT INTO monitor_alert_state (tracked_event_id)
+                SELECT id FROM tracked_events;
+            CREATE TABLE monitor_alert_records (
+                id INTEGER PRIMARY KEY,
+                tracked_event_id TEXT NOT NULL REFERENCES tracked_events(id) ON DELETE CASCADE,
+                event_provider_id INTEGER NOT NULL,
+                observation_id INTEGER NOT NULL,
+                cycle_number INTEGER NOT NULL CHECK (cycle_number >= 1),
+                simulation_only INTEGER NOT NULL CHECK (simulation_only IN (0, 1)),
+                total_per_ticket REAL NOT NULL CHECK (total_per_ticket > 0),
+                currency TEXT NOT NULL CHECK (length(currency) = 3),
+                available_quantity INTEGER NOT NULL CHECK (available_quantity >= 1),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE (tracked_event_id, cycle_number),
+                FOREIGN KEY (event_provider_id, tracked_event_id)
+                    REFERENCES event_providers(id, tracked_event_id),
+                FOREIGN KEY (observation_id, tracked_event_id)
+                    REFERENCES price_observations(id, tracked_event_id)
+            );
+            CREATE INDEX idx_monitor_alert_records_created
+                ON monitor_alert_records(created_at, id);
+            PRAGMA user_version = 5;
+            COMMIT;
+            """
+        )
+
+    @staticmethod
+    def _migration_6(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            BEGIN EXCLUSIVE;
+            CREATE TABLE email_notification_outbox (
+                id INTEGER PRIMARY KEY,
+                monitor_alert_record_id INTEGER NOT NULL REFERENCES monitor_alert_records(id) ON DELETE CASCADE,
+                recipient_email TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'retryable')),
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                idempotency_key TEXT NOT NULL UNIQUE,
+                provider_message_id TEXT,
+                available_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                first_attempt_at TEXT,
+                claimed_at TEXT,
+                claim_token TEXT,
+                delivery_uncertain INTEGER NOT NULL DEFAULT 0 CHECK (delivery_uncertain IN (0, 1)),
+                last_error TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                sent_at TEXT,
+                UNIQUE (monitor_alert_record_id, recipient_email),
+                CHECK ((status = 'sending' AND claim_token IS NOT NULL AND claimed_at IS NOT NULL) OR status != 'sending')
+            );
+            CREATE INDEX idx_email_outbox_due
+                ON email_notification_outbox(status, available_at, created_at);
+            PRAGMA user_version = 6;
+            COMMIT;
+            """
+        )
+
     def migrate(self, target_version: int = CURRENT_SCHEMA_VERSION) -> None:
         """Apply pending schema migrations, or migrate to a test target version."""
         if target_version < 0 or target_version > CURRENT_SCHEMA_VERSION:
@@ -237,7 +307,7 @@ class Database:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version > CURRENT_SCHEMA_VERSION:
                 raise RuntimeError(f"database schema {version} is newer than supported schema {CURRENT_SCHEMA_VERSION}")
-            migrations = {1: self._migration_1, 2: self._migration_2, 3: self._migration_3, 4: self._migration_4}
+            migrations = {1: self._migration_1, 2: self._migration_2, 3: self._migration_3, 4: self._migration_4, 5: self._migration_5, 6: self._migration_6}
             while version < target_version:
                 migrations[version + 1](conn)
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -469,6 +539,154 @@ class Database:
             )
             if cursor.rowcount != 1:
                 raise KeyError(event_provider_id)
+
+    def record_monitor_alert(self, tracked_event_id: str, *, event_provider_id: int, observation_id: int, simulation_only: bool, total_per_ticket: float, currency: str, available_quantity: int) -> dict[str, Any] | None:
+        """Record one qualifying alert per armed price cycle; never sends a notification."""
+        total = _validate_price(total_per_ticket, "total_per_ticket", required=True)
+        currency = _validate_currency(currency)
+        quantity = _validate_quantity(available_quantity)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR IGNORE INTO monitor_alert_state (tracked_event_id) VALUES (?)", (tracked_event_id,))
+            state = conn.execute(
+                "SELECT armed, cycle_number FROM monitor_alert_state WHERE tracked_event_id = ?",
+                (tracked_event_id,),
+            ).fetchone()
+            if not state[0]:
+                return None
+            cursor = conn.execute(
+                "INSERT INTO monitor_alert_records (tracked_event_id, event_provider_id, observation_id, cycle_number, simulation_only, total_per_ticket, currency, available_quantity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (tracked_event_id, event_provider_id, observation_id, state[1], int(bool(simulation_only)), total, currency, quantity),
+            )
+            conn.execute(
+                "UPDATE monitor_alert_state SET armed = 0, cycle_number = cycle_number + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE tracked_event_id = ?",
+                (tracked_event_id,),
+            )
+            return {"id": int(cursor.lastrowid), "cycle_number": int(state[1]), "simulation_only": bool(simulation_only)}
+
+    def rearm_monitor_alert(self, tracked_event_id: str, *, checked_at: str) -> None:
+        """Rearm after a clear check, unless a later concurrent check alerted."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT OR IGNORE INTO monitor_alert_state (tracked_event_id) VALUES (?)", (tracked_event_id,))
+            conn.execute(
+                "UPDATE monitor_alert_state SET armed = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE tracked_event_id = ? AND NOT EXISTS (SELECT 1 FROM monitor_alert_records WHERE tracked_event_id = ? AND julianday(created_at) >= julianday(?))",
+                (tracked_event_id, tracked_event_id, checked_at),
+            )
+
+    def list_monitor_alert_records(self, *, simulation_only: bool | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        query = "SELECT a.*, e.name AS event_name, p.provider_key, po.listing_id FROM monitor_alert_records a JOIN tracked_events e ON e.id = a.tracked_event_id JOIN event_providers ep ON ep.id = a.event_provider_id JOIN providers p ON p.id = ep.provider_id JOIN price_observations po ON po.id = a.observation_id AND po.tracked_event_id = a.tracked_event_id"
+        params: list[Any] = []
+        if simulation_only is not None:
+            query += " WHERE a.simulation_only = ?"
+            params.append(int(simulation_only))
+        query += " ORDER BY a.created_at DESC, a.id DESC LIMIT ?"
+        params.append(limit)
+        with self._connection() as conn:
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def get_email_alert_context(self, monitor_alert_record_id: int) -> dict[str, Any] | None:
+        """Load immutable alert data for a delivery template, without email credentials."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT a.id AS alert_id, a.simulation_only, a.total_per_ticket AS observed_price, a.currency, a.available_quantity, a.created_at AS alert_created_at, e.name AS event_name, e.maximum_price AS target_price, e.ticket_quantity AS requested_quantity, po.observed_at AS checked_at, po.listing_url, po.listing_id FROM monitor_alert_records a JOIN tracked_events e ON e.id = a.tracked_event_id JOIN price_observations po ON po.id = a.observation_id AND po.tracked_event_id = a.tracked_event_id WHERE a.id = ?",
+                (monitor_alert_record_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def enqueue_email_notification(self, monitor_alert_record_id: int, *, recipient_email: str, idempotency_key: str) -> dict[str, Any]:
+        """Queue a real alert recipient once; simulation records are rejected."""
+        recipient_email = str(recipient_email).strip().lower()
+        if not recipient_email or not idempotency_key or len(idempotency_key) > 256:
+            raise ValueError("recipient_email and a valid idempotency_key are required")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            alert = conn.execute(
+                "SELECT simulation_only FROM monitor_alert_records WHERE id = ?",
+                (monitor_alert_record_id,),
+            ).fetchone()
+            if alert is None:
+                raise KeyError(monitor_alert_record_id)
+            if alert[0]:
+                raise ValueError("Simulation-only alerts cannot enter the customer email queue.")
+            conn.execute(
+                "INSERT INTO email_notification_outbox (monitor_alert_record_id, recipient_email, idempotency_key) VALUES (?, ?, ?) ON CONFLICT(monitor_alert_record_id, recipient_email) DO NOTHING",
+                (monitor_alert_record_id, recipient_email, idempotency_key),
+            )
+            row = conn.execute(
+                "SELECT * FROM email_notification_outbox WHERE monitor_alert_record_id = ? AND recipient_email = ?",
+                (monitor_alert_record_id, recipient_email),
+            ).fetchone()
+            if row["idempotency_key"] != idempotency_key:
+                raise ValueError("This notification already exists with a different idempotency key.")
+            return dict(row)
+
+    def claim_email_notifications(self, *, now: str, lease_seconds: float, limit: int, max_attempts: int, idempotency_retention_hours: float = 23.0) -> list[dict[str, Any]]:
+        """Claim due deliveries atomically; expired claims retain their idempotency key."""
+        if lease_seconds <= 0 or limit <= 0 or max_attempts <= 0 or idempotency_retention_hours <= 0:
+            raise ValueError("lease, limit, attempts, and retention must be positive")
+        now_dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_dt = now_dt.astimezone(timezone.utc)
+        lease_cutoff = (now_dt - timedelta(seconds=lease_seconds)).isoformat()
+        uncertain_cutoff = (now_dt - timedelta(hours=idempotency_retention_hours)).isoformat()
+        now_iso = now_dt.isoformat()
+        claimed = []
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE email_notification_outbox SET status = 'failed', claim_token = NULL, claimed_at = NULL, delivery_uncertain = 1, last_error = COALESCE(last_error, 'Delivery outcome is uncertain beyond the provider idempotency window.'), updated_at = ? WHERE delivery_uncertain = 1 AND status IN ('retryable', 'sending') AND first_attempt_at IS NOT NULL AND julianday(first_attempt_at) <= julianday(?)",
+                (now_iso, uncertain_cutoff),
+            )
+            conn.execute(
+                "UPDATE email_notification_outbox SET status = 'failed', claim_token = NULL, claimed_at = NULL, delivery_uncertain = CASE WHEN status = 'sending' THEN 1 ELSE delivery_uncertain END, last_error = COALESCE(last_error, 'Maximum delivery attempts reached.'), updated_at = ? WHERE attempt_count >= ? AND ((status = 'retryable' AND julianday(available_at) <= julianday(?)) OR (status = 'sending' AND julianday(claimed_at) <= julianday(?)))",
+                (now_iso, max_attempts, now_iso, lease_cutoff),
+            )
+            due = conn.execute(
+                "SELECT * FROM email_notification_outbox WHERE ((status IN ('pending', 'retryable') AND julianday(available_at) <= julianday(?) AND attempt_count < ?) OR (status = 'sending' AND julianday(claimed_at) <= julianday(?) AND attempt_count < ?)) ORDER BY created_at, id LIMIT ?",
+                (now_iso, max_attempts, lease_cutoff, max_attempts, limit),
+            ).fetchall()
+            for row in due:
+                token = str(uuid.uuid4())
+                was_claimed = row["status"] == "sending"
+                conn.execute(
+                    "UPDATE email_notification_outbox SET status = 'sending', attempt_count = attempt_count + 1, first_attempt_at = COALESCE(first_attempt_at, ?), claimed_at = ?, claim_token = ?, delivery_uncertain = CASE WHEN ? THEN 1 ELSE delivery_uncertain END, updated_at = ? WHERE id = ?",
+                    (now_iso, now_iso, token, int(was_claimed), now_iso, row["id"]),
+                )
+                claimed_row = conn.execute("SELECT * FROM email_notification_outbox WHERE id = ?", (row["id"],)).fetchone()
+                claimed.append(dict(claimed_row))
+        return claimed
+
+    def mark_email_notification_sent(self, delivery_id: int, claim_token: str, *, provider_message_id: str, sent_at: str) -> bool:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE email_notification_outbox SET status = 'sent', provider_message_id = ?, sent_at = ?, claim_token = NULL, claimed_at = NULL, delivery_uncertain = 0, last_error = NULL, updated_at = ? WHERE id = ? AND status = 'sending' AND claim_token = ?",
+                (provider_message_id, sent_at, sent_at, delivery_id, claim_token),
+            )
+            return cursor.rowcount == 1
+
+    def mark_email_notification_failure(self, delivery_id: int, claim_token: str, *, status: str, error: str, retry_at: str, delivery_uncertain: bool, updated_at: str) -> bool:
+        if status not in {"retryable", "failed"}:
+            raise ValueError("email delivery failure status must be retryable or failed")
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "UPDATE email_notification_outbox SET status = ?, available_at = ?, claim_token = NULL, claimed_at = NULL, delivery_uncertain = CASE WHEN ? THEN 1 ELSE delivery_uncertain END, last_error = ?, updated_at = ? WHERE id = ? AND status = 'sending' AND claim_token = ?",
+                (status, retry_at, int(delivery_uncertain), error[:1000], updated_at, delivery_id, claim_token),
+            )
+            return cursor.rowcount == 1
+
+    def list_email_notification_deliveries(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT n.*, a.tracked_event_id, e.name AS event_name, a.simulation_only FROM email_notification_outbox n JOIN monitor_alert_records a ON a.id = n.monitor_alert_record_id JOIN tracked_events e ON e.id = a.tracked_event_id ORDER BY n.created_at DESC, n.id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def add_observation(self, event_id: str, *, price_per_ticket: float, currency: str, observed_at: str, pricing_confidence: str, source: str = "unknown", event_provider_id: int | None = None, listing_id: str | None = None, listing_url: str | None = None, section: str | None = None, row_label: str | None = None, fees_per_ticket: float | None = None, total_per_ticket: float | None = None, available_quantity: int | None = None) -> int:
         if pricing_confidence not in {"verified_all_in", "estimated", "incomplete"}:

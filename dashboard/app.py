@@ -22,6 +22,7 @@ from conscope_app.dashboard_data import (  # noqa: E402
     dashboard_snapshot,
     delete_event_after_confirmation,
     event_price_history,
+    monitoring_status_snapshot,
     observation_is_stale,
     run_manual_mock_check,
 )
@@ -445,6 +446,8 @@ def _event_card(database: Database, card: dict) -> None:
                     database.resume_event(event["id"])
                     _record_notice("success", f"Resumed {event['name']}.")
                     _rerun()
+
+
             elif action_columns[0].button("Pause monitoring", key=f"pause_{event['id']}", use_container_width=True):
                 database.pause_event(event["id"])
                 _record_notice("info", f"Paused {event['name']}.")
@@ -488,6 +491,38 @@ def _event_card(database: Database, card: dict) -> None:
                     _rerun()
 
 
+def _monitoring_status_view(database: Database) -> None:
+    status = monitoring_status_snapshot(database)
+    st.subheader("Automatic monitoring status")
+    if status["checks"]:
+        rows = []
+        for item in status["checks"]:
+            rows.append({
+                "Event": item["event"],
+                "Provider": item["provider"],
+                "Status": "Paused" if item["paused"] else (item["last_error"] or ("Checked" if item["last_success_at"] else ("Live pricing disabled" if item["provider_key"] in {"ticketmaster", "seatgeek"} else "Not checked"))),
+                "Last attempt": item["last_attempt_at"] or "—",
+                "Last success": item["last_success_at"] or "—",
+                "Next check": item["next_check_at"] or "Not scheduled",
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No provider checks have been scheduled yet.")
+
+    st.markdown("**Simulation-only alert results**")
+    st.caption("Test records created from simulated prices. They never send email or contact customers.")
+    if status["simulation_alerts"]:
+        st.dataframe([{
+            "Event": item["event_name"],
+            "Target result": f"{item['currency']} {item['total_per_ticket']:,.2f} per ticket",
+            "Quantity": item["available_quantity"],
+            "Cycle": item["cycle_number"],
+            "Created": item["created_at"],
+        } for item in status["simulation_alerts"]], use_container_width=True, hide_index=True)
+    else:
+        st.caption("No simulated alert records yet.")
+
+
 def main() -> None:
     database = get_database()
     st.title("🎟️ ConScope")
@@ -505,6 +540,8 @@ def main() -> None:
     else:
         summary[3].metric("Last successful check", "Never")
     st.caption("Active alerts are saved price targets. Email notifications are not part of this phase.")
+
+    _monitoring_status_view(database)
 
     st.subheader("Lowest observed listing prices")
     lowest_rows = []

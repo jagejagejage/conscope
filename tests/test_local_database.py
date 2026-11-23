@@ -177,6 +177,11 @@ class LocalDatabaseTests(unittest.TestCase):
         self.assertEqual(upgraded.get_event("legacy-event")["alert_enabled"], 1)
         self.assertEqual(upgraded.get_event("legacy-event")["allow_estimated_prices"], 0)
         self.assertEqual(upgraded.get_event("legacy-event")["images"], [])
+        with sqlite3.connect(path) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT armed, cycle_number FROM monitor_alert_state WHERE tracked_event_id = ?",
+                ("legacy-event",),
+            ).fetchone(), (1, 1))
 
     def test_v2_observations_gain_provider_source_during_v3_migration(self):
         path = self.root / "source-migration.sqlite3"

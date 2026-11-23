@@ -10,10 +10,13 @@ from conscope_app.dashboard_data import (
     dashboard_snapshot,
     delete_event_after_confirmation,
     event_price_history,
+    monitoring_status_snapshot,
     observation_is_stale,
     run_manual_mock_check,
 )
 from conscope_app.database import Database
+from conscope_app.monitoring import run_monitoring_pass
+from conscope_app.providers.mock import MockProvider
 
 
 class DashboardDataTests(unittest.TestCase):
@@ -127,6 +130,20 @@ class DashboardDataTests(unittest.TestCase):
         self.assertEqual(edited["providers"][0]["provider_event_id"], "tm-event-2")
         self.assertIsNone(edited["providers"][0]["last_success_at"])
         self.assertEqual(self.database.list_observations(self.event["id"])[0]["source"], "mock")
+
+    def test_monitoring_status_view_reports_provider_schedule_and_simulation_records(self):
+        before = monitoring_status_snapshot(self.database)
+        self.assertEqual(before["checks"][0]["last_attempt_at"], None)
+        self.assertEqual(before["checks"][0]["next_check_at"], None)
+        self.assertEqual(before["simulation_alerts"], [])
+
+        run_monitoring_pass(
+            self.database, {"mock": MockProvider()}, simulation_mode=True, interval_seconds=60,
+        )
+        after = monitoring_status_snapshot(self.database)
+        self.assertIsNotNone(after["checks"][0]["last_attempt_at"])
+        self.assertIsNotNone(after["checks"][0]["next_check_at"])
+        self.assertEqual(len(after["simulation_alerts"]), 1)
 
 
 if __name__ == "__main__":
