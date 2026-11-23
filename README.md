@@ -64,7 +64,27 @@ cp .env.example .env
 # Add your API keys to .env
 ```
 
-### Running the System
+### Run the Local SQLite Dashboard
+
+The local dashboard does not require Docker, Kafka, PostgreSQL, an API key, or a `.env` file. On macOS, create an environment and install only the dashboard dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install streamlit==1.29.0 plotly==5.18.0 requests==2.31.0
+python -m streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+For Ticketmaster event search, configure `TICKETMASTER_API_KEY` in the same shell before launching Streamlit. Obtain a key by registering an application in the [Ticketmaster Developer Portal](https://developer.ticketmaster.com/). Keep the key out of source control.
+
+```bash
+export TICKETMASTER_API_KEY='your-key'
+python -m streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501
+```
+
+On PowerShell, set it with `$env:TICKETMASTER_API_KEY = 'your-key'`. Open `http://127.0.0.1:8501` and use **Find an event to watch**. Search only discovers events and saves a target; live ticket checks, automated monitoring, and email alerts remain disabled. The advanced manual event form is still available. On macOS, local data is stored in `~/Library/Application Support/ConScope/conscope.sqlite3`. Set `CONSCOPE_DATA_DIR` to use another data directory.
+
+### Running the Legacy Kafka System
 
 #### Quick Start (Using Mock Producer)
 
