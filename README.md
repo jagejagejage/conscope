@@ -314,3 +314,36 @@ Aaron Zhou - [GitHub](https://github.com/aarowz) | [LinkedIn](https://linkedin.c
 ---
 
 **Built with Kafka for distributed, real-time event processing.**
+
+## Phase 6A Web Frontend Demo
+
+A separate Next.js frontend prototype lives in `web/`. It preserves the existing Python and Streamlit application. The website currently demonstrates the planned mobile-friendly workflow with fictional events and simulated price history only.
+
+### Run locally
+
+Requirements: Node.js 20.9 or newer and npm.
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open <http://localhost:3000>. Use **Discover** to search the sample catalog, choose an event, enter ticket quantity and a USD target per ticket, and add it to the watchlist. The dashboard, event details, watchlist controls, and settings use browser `localStorage` only. Changes are not shared between browsers or devices.
+
+To check the frontend locally:
+
+```bash
+cd web
+npm run typecheck
+npm run lint
+npm run build
+```
+
+### Demo limitations
+
+- Every event, price trend, low price, and alert result is fictional and labeled as simulated.
+- Search does not call Ticketmaster or any other ticket provider. No listing availability, quantity, fees, or all-in price is verified.
+- No live monitoring, scheduled checks, authentication, backend, email delivery, or cross-device sync is connected. Email settings only demonstrate a local preference screen; no email is sent.
+- No provider credentials are needed or read by the frontend.
+- The typed `ConScopeDataSource` interface is a UI data-access boundary for a future authenticated backend. This phase does not add that backend or change the Python monitoring engine.

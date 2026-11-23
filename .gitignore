@@ -53,3 +53,7 @@ Thumbs.db
 .coverage
 htmlcov/
 .pytest_cache/
+
+# The Next.js frontend keeps its typed data boundary in a local lib/ folder.
+!web/lib/
+!web/lib/**
